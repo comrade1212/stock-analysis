@@ -1,0 +1,28 @@
+# Railway 유료 cron 서비스 대신 GitHub Actions(무료)로 수급 업데이트를 트리거한다
+name: 수급 데이터 일일 업데이트
+
+on:
+  schedule:
+    # 평일 18:40 KST (= 09:40 UTC). 한국 장 마감(15:30 KST) 후 실행
+    - cron: "40 9 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 수급 업데이트 트리거
+        env:
+          SERVICE_URL: ${{ vars.SERVICE_URL || 'https://systemtrading-rest-production.up.railway.app' }}
+          UPDATE_SECRET: ${{ secrets.UPDATE_SECRET }}
+        run: |
+          if [ -z "$UPDATE_SECRET" ]; then
+            echo "::error::리포지토리 Settings → Secrets → Actions 에 UPDATE_SECRET 을 등록하세요 (Railway의 UPDATE_SECRET 환경변수와 동일한 값)"
+            exit 1
+          fi
+          # -N: SSE 스트리밍 실시간 출력 / -f: HTTP 오류 시 실패 처리
+          # 서버는 백그라운드 스레드로 업데이트하므로 연결이 끊겨도 업데이트는 계속된다
+          curl -fsS -N --max-time 1700 \
+            -H "X-Update-Secret: $UPDATE_SECRET" \
+            "$SERVICE_URL/api/admin/update-all"
