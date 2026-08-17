@@ -620,8 +620,11 @@ def search(q: str = Query(..., min_length=1)):
 
 
 # 업데이트 진행 상태 (중복 실행 방지 + 상태 조회용)
-_update_state = {"running": False, "started_at": None, "finished_at": None, "last_message": None}
+_update_state = {"running": False, "started_at": None, "started_ts": 0.0,
+                 "finished_at": None, "last_message": None}
 _update_lock = threading.Lock()
+# running 이 이 시간보다 오래 유지되면 죽은 실행으로 보고 새 실행을 허용한다
+_UPDATE_STALE_SEC = 2 * 60 * 60
 
 
 def _run_update_thread(ticker_list, q: queue.Queue):
@@ -656,14 +659,25 @@ async def admin_update_all(
 
     with _update_lock:
         if _update_state["running"]:
-            raise HTTPException(status_code=409, detail="이미 업데이트가 진행 중입니다")
+            # 워커가 죽어 running 이 남아버린 경우까지 영구히 막지는 않는다.
+            started_ts = _update_state.get("started_ts") or 0
+            if time.time() - started_ts < _UPDATE_STALE_SEC:
+                raise HTTPException(status_code=409, detail="이미 업데이트가 진행 중입니다")
         _update_state["running"] = True
         _update_state["started_at"] = now_kst().isoformat()
+        _update_state["started_ts"] = time.time()
         _update_state["finished_at"] = None
 
     ticker_list = [t.strip() for t in tickers.split(",")] if tickers else None
     q: queue.Queue = queue.Queue()
-    threading.Thread(target=_run_update_thread, args=(ticker_list, q), daemon=True).start()
+    try:
+        threading.Thread(target=_run_update_thread, args=(ticker_list, q), daemon=True).start()
+    except Exception as e:
+        # 스레드 기동 실패 시 running 을 되돌리지 않으면 이후 모든 요청이 409로 영구히 막힌다
+        with _update_lock:
+            _update_state["running"] = False
+            _update_state["finished_at"] = now_kst().isoformat()
+        raise HTTPException(status_code=500, detail=f"업데이트 스레드 기동 실패: {e}")
 
     async def async_generate():
         loop = asyncio.get_event_loop()

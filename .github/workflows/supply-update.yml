@@ -1,28 +1,133 @@
-# Railway 유료 cron 서비스 대신 GitHub Actions(무료)로 수급 업데이트를 트리거한다
+# Railway 유료 cron 서비스 대신 GitHub Actions(무료)로 수급 업데이트를 트리거한다.
+#
+# ⚠️ schedule 트리거는 "기본 브랜치(default branch)"에 있는 워크플로만 실행된다.
+#    이 파일이 다른 브랜치에만 있으면 자동 실행이 절대 일어나지 않는다.
 name: 수급 데이터 일일 업데이트
 
 on:
   schedule:
     # 평일 18:40 KST (= 09:40 UTC). 한국 장 마감(15:30 KST) 후 실행
     - cron: "40 9 * * 1-5"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "쉼표 구분 종목코드 (비우면 전체 종목)"
+        required: false
+        default: ""
+
+# 이전 실행이 아직 돌고 있으면 겹쳐 실행하지 않는다 (서버가 409로 거부하므로)
+concurrency:
+  group: supply-update
+  cancel-in-progress: false
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
+    env:
+      SERVICE_URL: ${{ vars.SERVICE_URL || 'https://systemtrading-rest-production.up.railway.app' }}
+      UPDATE_SECRET: ${{ secrets.UPDATE_SECRET }}
     steps:
-      - name: 수급 업데이트 트리거
-        env:
-          SERVICE_URL: ${{ vars.SERVICE_URL || 'https://systemtrading-rest-production.up.railway.app' }}
-          UPDATE_SECRET: ${{ secrets.UPDATE_SECRET }}
+      # railway.json 의 sleepApplication 때문에 첫 요청은 콜드 스타트가 필요하다.
+      # 깨어나는 데 수십 초가 걸리므로 바로 update-all 을 때리면 타임아웃으로 오인된다.
+      - name: 서버 깨우기
         run: |
-          if [ -z "$UPDATE_SECRET" ]; then
-            echo "::error::리포지토리 Settings → Secrets → Actions 에 UPDATE_SECRET 을 등록하세요 (Railway의 UPDATE_SECRET 환경변수와 동일한 값)"
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 \
+                     "$SERVICE_URL/api/cache-status" || true)
+            echo "기동 확인 $i회차: HTTP $code"
+            [ "$code" = "200" ] && echo "서버 기동 완료" && exit 0
+            sleep $((i * 5))
+          done
+          echo "::error::Railway 서비스가 응답하지 않습니다 ($SERVICE_URL). 서비스 상태와 SERVICE_URL 변수를 확인하세요."
+          exit 1
+
+      # 업데이트를 쏘기 전에 서버가 실제로 업데이트를 수행할 수 있는 상태인지 먼저 확인한다.
+      # 여기서 걸리는 문제들이 전부 "돌긴 도는데 데이터가 안 늘어나는" 원인이었다.
+      - name: 설정 진단
+        run: |
+          body=$(mktemp)
+          code=$(curl -s -o "$body" -w '%{http_code}' --max-time 120 \
+                   -H "X-Update-Secret: $UPDATE_SECRET" \
+                   "$SERVICE_URL/api/admin/status" || echo 000)
+          echo "GET /api/admin/status → HTTP $code"
+
+          if [ "$code" = "401" ]; then
+            if [ -z "$UPDATE_SECRET" ]; then
+              echo "::error::Railway 에는 UPDATE_SECRET 이 설정돼 있는데 이 저장소에는 없습니다. Settings → Secrets and variables → Actions → New repository secret 에 UPDATE_SECRET 을 Railway 와 '같은 값'으로 등록하세요."
+            else
+              echo "::error::UPDATE_SECRET 값이 Railway 값과 다릅니다. 양쪽 값을 동일하게 맞추세요 (앞뒤 공백/줄바꿈 주의)."
+            fi
             exit 1
           fi
-          # -N: SSE 스트리밍 실시간 출력 / -f: HTTP 오류 시 실패 처리
-          # 서버는 백그라운드 스레드로 업데이트하므로 연결이 끊겨도 업데이트는 계속된다
-          curl -fsS -N --max-time 1700 \
-            -H "X-Update-Secret: $UPDATE_SECRET" \
-            "$SERVICE_URL/api/admin/update-all"
+
+          if [ "$code" != "200" ]; then
+            echo "::error::상태 진단 실패 (HTTP $code)"; cat "$body"; exit 1
+          fi
+
+          jq . "$body" || cat "$body"
+
+          secret_set=$(jq -r '.update_secret_set' "$body")
+          inv_files=$(jq -r '.inv_files' "$body")
+          data_env=$(jq -r '.data_dir_env // "null"' "$body")
+
+          if [ "$secret_set" != "true" ]; then
+            echo "::error::Railway 서비스에 UPDATE_SECRET 환경변수가 없습니다. 이 상태에서는 /api/admin/update-all 이 503 으로 거부합니다. Railway → 서비스 → Variables 에 UPDATE_SECRET 을 추가하고, 같은 값을 이 저장소 Actions Secret 에도 등록하세요."
+            exit 1
+          fi
+
+          if [ "$data_env" = "null" ]; then
+            echo "::warning::DATA_DIR 환경변수가 없습니다. 영구 볼륨이 아닌 컨테이너 임시 디스크를 쓰고 있어 재배포 때마다 데이터가 사라집니다."
+          fi
+
+          if [ "$inv_files" = "0" ]; then
+            echo "::error::서버에 수급 파일(*_inv.parquet)이 0개입니다. 업데이트할 대상 자체가 없어 실행해도 아무 일도 일어나지 않습니다. Railway 에 Volume 을 붙이고 DATA_DIR 을 그 경로로 지정한 뒤, 웹 UI에서 종목을 한 번 내려받아 초기 데이터를 만드세요."
+            exit 1
+          fi
+
+          echo "진단 통과: 수급 파일 ${inv_files}개, DATA_DIR=${data_env}"
+
+      - name: 수급 업데이트 실행
+        env:
+          # 입력값을 셸에 직접 보간하지 않는다 (스크립트 인젝션 방지)
+          TICKERS: ${{ inputs.tickers }}
+        run: |
+          url="$SERVICE_URL/api/admin/update-all"
+          if [ -n "$TICKERS" ]; then
+            url="$url?tickers=$(jq -rn --arg t "$TICKERS" '$t|@uri')"
+          fi
+
+          out=$(mktemp); hdr=$(mktemp)
+          # -N: SSE 를 실시간으로 로그에 흘린다. 서버는 백그라운드 스레드로 돌기 때문에
+          # 연결이 끊겨도 업데이트 자체는 끝까지 진행된다.
+          # 상태 코드는 -w 대신 헤더 덤프에서 읽는다 (tee 출력과 섞이지 않게).
+          curl -sS -N --max-time 1700 -D "$hdr" \
+            -H "X-Update-Secret: $UPDATE_SECRET" "$url" | tee "$out"
+          rc=${PIPESTATUS[0]}
+          code=$(grep -E '^HTTP/' "$hdr" | tail -1 | awk '{print $2}')
+          echo "----- curl rc=$rc / HTTP ${code:-000} -----"
+
+          case "$code" in
+            200) ;;
+            409) echo "::warning::이미 업데이트가 진행 중입니다. 이번 실행은 건너뜁니다."; exit 0 ;;
+            503) echo "::error::서버가 UPDATE_SECRET 미설정으로 거부했습니다."; exit 1 ;;
+            401) echo "::error::UPDATE_SECRET 값이 Railway 값과 다릅니다."; exit 1 ;;
+            *)   echo "::error::업데이트 요청 실패 (HTTP ${code:-응답없음}, curl rc=$rc)"; exit 1 ;;
+          esac
+          if [ "$rc" != "0" ]; then
+            echo "::error::스트리밍이 도중에 끊겼습니다 (curl rc=$rc). 서버 백그라운드 작업은 계속 진행됐을 수 있으니 /api/admin/status 로 확인하세요."
+            exit 1
+          fi
+
+          # 마지막 SSE 메시지에서 실제 반영된 일수를 뽑아 '조용한 무동작'을 실패로 처리한다.
+          summary=$(grep -o '"msg": *"완료:[^"]*"' "$out" | tail -1 | sed 's/.*"msg": *"//; s/"$//')
+          if [ -z "$summary" ]; then
+            echo "::error::완료 메시지를 받지 못했습니다. 업데이트가 중간에 끊겼을 수 있습니다."
+            exit 1
+          fi
+          echo "$summary"
+
+          added=$(echo "$summary" | grep -o '[0-9]\+일 추가' | grep -o '[0-9]\+')
+          if [ "${added:-0}" = "0" ]; then
+            echo "::warning::추가된 거래일이 0일입니다. 이미 최신이거나(정상), 수집이 전부 실패했을 수 있습니다. 위 로그에서 '수집 실패' 항목을 확인하세요."
+          fi
